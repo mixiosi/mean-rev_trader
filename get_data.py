@@ -46,7 +46,7 @@ class IBapi(EWrapper, EClient):
         """Callback when all historical data has been received"""
         print(f"Historical data received for reqId {reqId}")
         if self.symbol:
-            file_path = f'{self.symbol}_5min-bar_3mo_historical_data.csv' # More descriptive filename
+            file_path = f'{self.symbol}_5min-bar_3y_historical_data.csv' # More descriptive filename
         else:
             file_path = 'historical_data.csv' # default if symbol is not set
         self.write_to_csv(file_path)
@@ -92,7 +92,7 @@ def main():
     # Wait briefly for the connection to establish
     time.sleep(1)
 
-    symbols = ['SPY', 'NVDA', 'RGTI', 'GOLD', 'QBTS', 'QUBT', 'TSLA', 'IONQ'] # Get data for all symbols
+    symbols = ['SPY'] # Get data for all symbols
 
     for ticker_symbol in symbols:
         print(f"Fetching historical data for {ticker_symbol}...")
@@ -111,7 +111,7 @@ def main():
             reqId=1,                  # Request ID (can be the same for sequential requests)
             contract=contract,        # Stock contract
             endDateTime="",           # Empty string for current time
-            durationStr="3 M",        # 200 days of data
+            durationStr="3 Y",        # 200 days of data
             barSizeSetting="5 mins",  # 5-minute bars
             whatToShow="TRADES",      # Show trade data
             useRTH=1,                 # Regular trading hours only

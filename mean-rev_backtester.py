@@ -8,10 +8,11 @@ import joblib
 from bb_ml_stable3 import SignalFilter
 
 # --- PARAMETERS FOR TUNING ---
-RSI_ENTRY = 10   # Entry threshold for RSI(2)
-RSI_EXIT = 50   # Exit threshold for RSI(2)
-SL_MULT = 0.5    # Stop-loss multiple of ATR
-TP_MULT = 1.5    # Take-profit multiple of ATR
+RSI_ENTRY = 15   # Entry threshold for RSI(2)
+RSI_EXIT = 60   # Exit threshold for RSI(2)
+SL_MULT = 1.0    # Stop-loss multiple of ATR
+TP_MULT = 1.0    # Take-profit multiple of ATR
+ATR_THRESHOLD = 5.0 # Volatility filter threshold
 
 # --- Lightweight Bar object to mimic IBKR's bar ---
 class Bar:
@@ -25,13 +26,22 @@ class Bar:
 
 # --- Simple Performance Analyzer (reuse from bb_ml_stable3 if possible) ---
 class PerformanceAnalyzer:
-    def __init__(self):
+    def __init__(self, starting_cash=25000, commission=1.0, slippage_bps=1):
         self.trade_log = pd.DataFrame(columns=[
             'entry_time', 'exit_time', 'symbol', 'direction',
-            'quantity', 'entry_price', 'exit_price', 'pnl', 'exit_reason'])
+            'quantity', 'entry_price', 'exit_price', 'pnl', 'exit_reason', 'commission', 'slippage'])
+        self.starting_cash = starting_cash
+        self.commission = commission
+        self.slippage_bps = slippage_bps  # basis points (1 bps = 0.01%)
 
     def log_trade(self, entry_time, exit_time, symbol, direction, quantity, entry_price, exit_price, exit_reason=None):
-        pnl = (exit_price - entry_price) * quantity if direction == 'BUY' else (entry_price - exit_price) * quantity
+        # Calculate slippage: applied to both entry and exit
+        slippage = (entry_price + exit_price) * 0.5 * self.slippage_bps / 10000 * quantity
+        commission = self.commission * 2  # round trip
+        if direction == 'BUY':
+            pnl = (exit_price - entry_price) * quantity - commission - slippage
+        else:
+            pnl = (entry_price - exit_price) * quantity - commission - slippage
         new_trade = pd.DataFrame([{
             'entry_time': entry_time,
             'exit_time': exit_time,
@@ -41,7 +51,9 @@ class PerformanceAnalyzer:
             'entry_price': entry_price,
             'exit_price': exit_price,
             'pnl': pnl,
-            'exit_reason': exit_reason
+            'exit_reason': exit_reason,
+            'commission': commission,
+            'slippage': slippage
         }])
         self.trade_log = pd.concat([self.trade_log, new_trade], ignore_index=True)
 
@@ -55,12 +67,13 @@ class PerformanceAnalyzer:
         for symbol in self.trade_log['symbol'].unique():
             symbol_trades = self.trade_log[self.trade_log['symbol'] == symbol]
             symbol_trades = symbol_trades.sort_values('exit_time')
+            equity = symbol_trades['pnl'].cumsum() + self.starting_cash
             plt.plot(pd.to_datetime(symbol_trades['exit_time']),
-                    symbol_trades['pnl'].cumsum(),
+                    equity,
                     label=symbol)
         plt.title('Strategy Equity Curve (SPY)')
         plt.xlabel('Date')
-        plt.ylabel('Cumulative PnL')
+        plt.ylabel('Equity ($)')
         plt.legend()
         plt.grid(True)
         plt.show()
@@ -68,29 +81,26 @@ class PerformanceAnalyzer:
         # --- Analytics ---
         pnl = self.trade_log['pnl']
         returns = pnl / self.trade_log['entry_price']
-        # Sharpe ratio (assume 252*78 trading periods/year for 5min bars)
         sharpe = np.nan
         if len(returns.dropna()) > 1:
             sharpe = (returns.mean() / returns.std()) * np.sqrt(252*78)
-        # Max drawdown
         cum_pnl = pnl.cumsum()
-        roll_max = cum_pnl.cummax()
-        drawdown = cum_pnl - roll_max
+        equity = cum_pnl + self.starting_cash
+        roll_max = equity.cummax()
+        drawdown = equity - roll_max
         max_dd = drawdown.min()
-        # Win rate
+        max_dd_pct = (max_dd / self.starting_cash) * 100
         wins = (pnl > 0).sum()
         total = len(pnl)
         win_rate = wins / total if total > 0 else np.nan
         print("\n--- Performance Analytics ---")
         print(f"Sharpe Ratio: {sharpe:.2f}")
-        print(f"Max Drawdown: {max_dd:.2f}")
+        print(f"Max Drawdown: {max_dd:.2f} ({max_dd_pct:.2f}%)")
         print(f"Win Rate: {win_rate:.2%}")
 
-        # Export trade log to CSV
         csv_path = os.path.join(os.getcwd(), 'trade_log_export.csv')
         self.trade_log.to_csv(csv_path, index=False)
         print(f"\nTrade log exported to: {csv_path}")
-
         print(self.trade_log)
 
 # --- Mock Order Manager ---
@@ -168,11 +178,12 @@ class MockOrderManager:
 # --- Grid Search for Parameter Optimization ---
 from itertools import product
 
-def run_backtest_param(symbols, data_dir, rsi_entry, rsi_exit, sl_mult, tp_mult, verbose=False):
-    # Override global params for this run
-    global RSI_ENTRY, RSI_EXIT, SL_MULT, TP_MULT
+def run_backtest_param(symbols, data_dir, rsi_entry, rsi_exit, sl_mult, tp_mult, sma_len=50, atr_thresh=None, verbose=False, commission=1.0, slippage_bps=1):
+    global RSI_ENTRY, RSI_EXIT, SL_MULT, TP_MULT, ATR_THRESHOLD
     RSI_ENTRY, RSI_EXIT, SL_MULT, TP_MULT = rsi_entry, rsi_exit, sl_mult, tp_mult
-    perf = PerformanceAnalyzer()
+    if atr_thresh is not None:
+        ATR_THRESHOLD = atr_thresh
+    perf = PerformanceAnalyzer(commission=commission, slippage_bps=slippage_bps)
     for symbol in symbols:
         if symbol != 'SPY':
             continue
@@ -185,25 +196,28 @@ def run_backtest_param(symbols, data_dir, rsi_entry, rsi_exit, sl_mult, tp_mult,
             continue
         bars = [Bar(row['date'], row['open'], row['high'], row['low'], row['close'], row['volume']) for idx, row in df.iterrows()]
         order_manager = MockOrderManager(app=type('App', (), {'performance_analyzer': perf})())
-        closes, highs, lows = [], [], []
-        for bar in bars:
+        closes = []
+        highs = []
+        lows = []
+        for i, bar in enumerate(bars):
             closes.append(bar.close)
             highs.append(bar.high)
             lows.append(bar.low)
-            if len(closes) < 15:
+            if len(closes) < sma_len:
                 continue
             import talib
-            close_arr = np.array(closes[-15:])
+            close_arr = np.array(closes[-sma_len:])
             high_arr = np.array(highs[-15:])
             low_arr = np.array(lows[-15:])
-            rsi2 = talib.RSI(close_arr, timeperiod=2)[-1]
-            atr = talib.ATR(high_arr, low_arr, close_arr, timeperiod=14)[-1]
-            if order_manager.position == 0 and rsi2 < RSI_ENTRY:
-                order_manager.evaluate_long_entry(symbol, bar, atr)
+            rsi2 = talib.RSI(close_arr[-15:], timeperiod=2)[-1]
+            atr = talib.ATR(high_arr, low_arr, close_arr[-15:], timeperiod=14)[-1]
+            sma = pd.Series(close_arr).rolling(window=sma_len).mean().iloc[-1]
+            if bar.close > sma and atr < ATR_THRESHOLD:
+                if order_manager.position == 0 and rsi2 < RSI_ENTRY:
+                    order_manager.evaluate_long_entry(symbol, bar, atr)
             elif order_manager.position == 1 and rsi2 > RSI_EXIT:
                 order_manager.close_position(symbol, bar, exit_reason='RSI')
             order_manager.check_exit(symbol, bar)
-    # Return total PnL
     if perf.trade_log.empty:
         return -np.inf if not verbose else (None, -np.inf)
     total_pnl = perf.trade_log['pnl'].sum()
@@ -211,30 +225,39 @@ def run_backtest_param(symbols, data_dir, rsi_entry, rsi_exit, sl_mult, tp_mult,
         perf.generate_report()
     return total_pnl
 
-def grid_search(symbols, data_dir):
-    rsi_entry_range = [2, 5, 10]
-    rsi_exit_range = [50, 60, 70]
-    sl_mult_range = [0.5, 1.0, 1.5]
-    tp_mult_range = [1.0, 1.5, 2.0]
-    best_pnl = -np.inf
-    best_params = None
-    results = []
-    for rsi_entry, rsi_exit, sl_mult, tp_mult in product(rsi_entry_range, rsi_exit_range, sl_mult_range, tp_mult_range):
-        pnl = run_backtest_param(symbols, data_dir, rsi_entry, rsi_exit, sl_mult, tp_mult)
-        results.append((rsi_entry, rsi_exit, sl_mult, tp_mult, pnl))
-        if pnl > best_pnl:
-            best_pnl = pnl
-            best_params = (rsi_entry, rsi_exit, sl_mult, tp_mult)
-    print("Grid Search Results (top 10):")
-    results.sort(key=lambda x: x[-1], reverse=True)
-    for row in results[:10]:
-        print(f"RSI_ENTRY={row[0]}, RSI_EXIT={row[1]}, SL_MULT={row[2]}, TP_MULT={row[3]} => Total PnL: {row[4]:.2f}")
-    print(f"\nBest Params: RSI_ENTRY={best_params[0]}, RSI_EXIT={best_params[1]}, SL_MULT={best_params[2]}, TP_MULT={best_params[3]} => Total PnL: {best_pnl:.2f}")
-    return best_params
+def run_backtest_param_split(symbols, data_dir, rsi_entry, rsi_exit, sl_mult, tp_mult, sma_len=50, atr_thresh=None, verbose=False, commission=1.0, slippage_bps=1):
+    global RSI_ENTRY, RSI_EXIT, SL_MULT, TP_MULT, ATR_THRESHOLD
+    RSI_ENTRY, RSI_EXIT, SL_MULT, TP_MULT = rsi_entry, rsi_exit, sl_mult, tp_mult
+    if atr_thresh is not None:
+        ATR_THRESHOLD = atr_thresh
+    for symbol in symbols:
+        if symbol != 'SPY':
+            continue
+        csv_path = os.path.join(data_dir, f"{symbol}_5min-bar_3mo_historical_data.csv")
+        if not os.path.exists(csv_path):
+            continue
+        df = pd.read_csv(csv_path)
+        required_cols = {'date', 'open', 'high', 'low', 'close', 'volume'}
+        if not required_cols.issubset(df.columns):
+            continue
+        n = len(df)
+        split_idx = int(n * 0.7)
+        df_in = df.iloc[:split_idx]
+        df_out = df.iloc[split_idx:]
+        print(f"\nIn-sample: {df_in['date'].iloc[0]} to {df_in['date'].iloc[-1]}")
+        print(f"Out-of-sample: {df_out['date'].iloc[0]} to {df_out['date'].iloc[-1]}")
+        print("\n--- IN-SAMPLE ---")
+        run_backtest_param([symbol], data_dir, rsi_entry, rsi_exit, sl_mult, tp_mult, sma_len, atr_thresh, verbose=True, commission=commission, slippage_bps=slippage_bps)
+        print("\n--- OUT-OF-SAMPLE ---")
+        # Save a temp CSV for out-of-sample and point to it
+        temp_path = os.path.join(data_dir, f"{symbol}_temp_out_of_sample.csv")
+        df_out.to_csv(temp_path, index=False)
+        run_backtest_param([symbol], data_dir, rsi_entry, rsi_exit, sl_mult, tp_mult, sma_len, atr_thresh, verbose=True, commission=commission, slippage_bps=slippage_bps)
+        os.remove(temp_path)
 
 # --- Main Backtest Logic ---
-def run_backtest(symbols, data_dir, model_path=None):
-    perf = PerformanceAnalyzer()
+def run_backtest(symbols, data_dir, model_path=None, starting_cash=25000):
+    perf = PerformanceAnalyzer(starting_cash=starting_cash)
     for symbol in symbols:
         if symbol != 'SPY':
             continue  # Only trade SPY for this strategy
@@ -253,34 +276,52 @@ def run_backtest(symbols, data_dir, model_path=None):
         closes = []
         highs = []
         lows = []
+        # We'll store signals for each bar, but only act on them at the NEXT bar
+        signals = []  # Each element: dict with keys 'long_entry', 'long_exit', 'atr', 'sma50', 'rsi2', 'bar'
         for i, bar in enumerate(bars):
             closes.append(bar.close)
             highs.append(bar.high)
             lows.append(bar.low)
-            if len(closes) < 15:
+            if len(closes) < 50:
+                signals.append(None)
                 continue
             import talib
-            close_arr = np.array(closes[-15:])
+            close_arr = np.array(closes[-50:])
             high_arr = np.array(highs[-15:])
             low_arr = np.array(lows[-15:])
-            rsi2 = talib.RSI(close_arr, timeperiod=2)[-1]
-            atr = talib.ATR(high_arr, low_arr, close_arr, timeperiod=14)[-1]
-            # Entry: RSI(2) < RSI_ENTRY and not in position
-            if order_manager.position == 0 and rsi2 < RSI_ENTRY:
-                order_manager.evaluate_long_entry(symbol, bar, atr)
-            # Exit: RSI(2) > RSI_EXIT or SL/TP
-            elif order_manager.position == 1 and rsi2 > RSI_EXIT:
+            rsi2 = talib.RSI(close_arr[-15:], timeperiod=2)[-1]
+            atr = talib.ATR(high_arr, low_arr, close_arr[-15:], timeperiod=14)[-1]
+            sma50 = pd.Series(close_arr).rolling(window=50).mean().iloc[-1]
+            # Compute signals using only data up to the PREVIOUS bar
+            if i == 0:
+                signals.append(None)
+                continue
+            prev_bar = bars[i-1]
+            prev_close_arr = np.array(closes[-51:-1])
+            prev_high_arr = np.array(highs[-16:-1])
+            prev_low_arr = np.array(lows[-16:-1])
+            prev_rsi2 = talib.RSI(prev_close_arr[-15:], timeperiod=2)[-1]
+            prev_atr = talib.ATR(prev_high_arr, prev_low_arr, prev_close_arr[-15:], timeperiod=14)[-1]
+            prev_sma50 = pd.Series(prev_close_arr).rolling(window=50).mean().iloc[-1]
+            long_entry = (prev_bar.close > prev_sma50 and prev_atr < ATR_THRESHOLD and order_manager.position == 0 and prev_rsi2 < RSI_ENTRY)
+            long_exit = (order_manager.position == 1 and prev_rsi2 > RSI_EXIT)
+            signals.append({'long_entry': long_entry, 'long_exit': long_exit, 'atr': prev_atr, 'sma50': prev_sma50, 'rsi2': prev_rsi2, 'bar': bar})
+        # Now, execute trades based on the *previous* bar's signal, at the current bar
+        for i, signal in enumerate(signals):
+            if signal is None:
+                continue
+            bar = signal['bar']
+            if signal['long_entry']:
+                order_manager.evaluate_long_entry(symbol, bar, signal['atr'])
+            elif signal['long_exit']:
                 order_manager.close_position(symbol, bar, exit_reason='RSI')
-            # Always check for SL/TP
             order_manager.check_exit(symbol, bar)
     perf.generate_report()
 
 if __name__ == "__main__":
-    symbols = ['SPY', 'NVDA', 'RGTI', 'GOLD', 'QBTS', 'QUBT', 'TSLA', 'IONQ']
-    data_dir = r'c:/Users/chris/Desktop/workspace/trading/IBKR/BB_trader/train_model/tech_liquid_set'
-    model_path = 'trading_signal_model.joblib'  # Adjust if needed
-    # Uncomment below to run grid search
-    #grid_search(symbols, data_dir)
-    # Or run with chosen params:
-    # run_backtest_param(symbols, data_dir, 5, 60, 0.5, 1.0, verbose=True)
-    run_backtest(symbols, data_dir, None)
+    symbols = ['SPY']
+    data_dir = os.getcwd()
+    # Example: run with transaction costs, slippage, and out-of-sample split
+    run_backtest_param_split(symbols, data_dir, 15, 60, 1.0, 1.0, 50, 5.0, verbose=True, commission=1.0, slippage_bps=1)
+    #run_backtest_param(symbols, data_dir, 15, 60, 1.0, 1.0, 50, 5.0, verbose=True)
+    #run_backtest(symbols, data_dir, None)
