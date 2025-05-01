@@ -178,7 +178,7 @@ class MockOrderManager:
 # --- Grid Search for Parameter Optimization ---
 from itertools import product
 
-def run_backtest_param(symbols, data_dir, rsi_entry, rsi_exit, sl_mult, tp_mult, sma_len=50, atr_thresh=None, verbose=False, commission=1.0, slippage_bps=1):
+def run_backtest_param(symbols, data_dir, rsi_entry, rsi_exit, sl_mult, tp_mult, sma_len=50, atr_thresh=None, verbose=False, commission=1.0, slippage_bps=1, csv_override=None):
     global RSI_ENTRY, RSI_EXIT, SL_MULT, TP_MULT, ATR_THRESHOLD
     RSI_ENTRY, RSI_EXIT, SL_MULT, TP_MULT = rsi_entry, rsi_exit, sl_mult, tp_mult
     if atr_thresh is not None:
@@ -187,7 +187,10 @@ def run_backtest_param(symbols, data_dir, rsi_entry, rsi_exit, sl_mult, tp_mult,
     for symbol in symbols:
         if symbol != 'SPY':
             continue
-        csv_path = os.path.join(data_dir, f"{symbol}_5min-bar_3mo_historical_data.csv")
+        if csv_override is not None:
+            csv_path = csv_override
+        else:
+            csv_path = os.path.join(data_dir, f"{symbol}_5min-bar_3mo_historical_data.csv")
         if not os.path.exists(csv_path):
             continue
         df = pd.read_csv(csv_path)
@@ -237,23 +240,56 @@ def run_backtest_param_split(symbols, data_dir, rsi_entry, rsi_exit, sl_mult, tp
         if not os.path.exists(csv_path):
             continue
         df = pd.read_csv(csv_path)
-        required_cols = {'date', 'open', 'high', 'low', 'close', 'volume'}
-        if not required_cols.issubset(df.columns):
-            continue
         n = len(df)
-        split_idx = int(n * 0.7)
-        df_in = df.iloc[:split_idx]
-        df_out = df.iloc[split_idx:]
-        print(f"\nIn-sample: {df_in['date'].iloc[0]} to {df_in['date'].iloc[-1]}")
-        print(f"Out-of-sample: {df_out['date'].iloc[0]} to {df_out['date'].iloc[-1]}")
-        print("\n--- IN-SAMPLE ---")
-        run_backtest_param([symbol], data_dir, rsi_entry, rsi_exit, sl_mult, tp_mult, sma_len, atr_thresh, verbose=True, commission=commission, slippage_bps=slippage_bps)
+        split_idx = int(n * 0.8)
+    
+        df_in = df.iloc[:split_idx].copy()
+        df_out = df.iloc[split_idx:].copy()
+        # In-sample
+        temp_in_path = os.path.join(data_dir, f"{symbol}_temp_in_sample.csv")
+        df_in.to_csv(temp_in_path, index=False)
+        run_backtest_param([symbol], data_dir, rsi_entry, rsi_exit, sl_mult, tp_mult, sma_len, atr_thresh, verbose=True, commission=commission, slippage_bps=slippage_bps, csv_override=temp_in_path)
+        # Save in-sample trade log to CSV
+        in_sample_log_path = os.path.join(data_dir, f"{symbol}_in_sample_trades.csv")
+        if os.path.exists('trade_log_export.csv'):
+            os.replace('trade_log_export.csv', in_sample_log_path)
+        os.remove(temp_in_path)
         print("\n--- OUT-OF-SAMPLE ---")
-        # Save a temp CSV for out-of-sample and point to it
-        temp_path = os.path.join(data_dir, f"{symbol}_temp_out_of_sample.csv")
-        df_out.to_csv(temp_path, index=False)
-        run_backtest_param([symbol], data_dir, rsi_entry, rsi_exit, sl_mult, tp_mult, sma_len, atr_thresh, verbose=True, commission=commission, slippage_bps=slippage_bps)
-        os.remove(temp_path)
+        # Out-of-sample
+        temp_out_path = os.path.join(data_dir, f"{symbol}_temp_out_of_sample.csv")
+        df_out.to_csv(temp_out_path, index=False)
+        run_backtest_param([symbol], data_dir, rsi_entry, rsi_exit, sl_mult, tp_mult, sma_len, atr_thresh, verbose=True, commission=commission, slippage_bps=slippage_bps, csv_override=temp_out_path)
+        # Save out-of-sample trade log to CSV
+        out_sample_log_path = os.path.join(data_dir, f"{symbol}_out_of_sample_trades.csv")
+        if os.path.exists('trade_log_export.csv'):
+            os.replace('trade_log_export.csv', out_sample_log_path)
+        os.remove(temp_out_path)
+
+def grid_search(symbols, data_dir):
+    rsi_entry_range = [10, 15, 20]
+    rsi_exit_range = [50, 60, 70]
+    sl_mult_range = [0.5, 1.0, 1.5]
+    tp_mult_range = [0.5, 1.0, 1.5]
+    sma_len_range = [30, 50, 100]
+    atr_thresh_range = [3.0, 5.0, 7.0]
+    best_pnl = -np.inf
+    best_params = None
+    results = []
+    for rsi_entry, rsi_exit, sl_mult, tp_mult, sma_len, atr_thresh in product(rsi_entry_range, rsi_exit_range, sl_mult_range, tp_mult_range, sma_len_range, atr_thresh_range):
+        pnl = run_backtest_param(symbols, data_dir, rsi_entry, rsi_exit, sl_mult, tp_mult, sma_len, atr_thresh, verbose=False)
+        results.append((rsi_entry, rsi_exit, sl_mult, tp_mult, sma_len, atr_thresh, pnl))
+        if pnl > best_pnl:
+            best_pnl = pnl
+            best_params = (rsi_entry, rsi_exit, sl_mult, tp_mult, sma_len, atr_thresh)
+    print("Grid Search Results (top 10):")
+    results.sort(key=lambda x: x[-1], reverse=True)
+    for row in results[:10]:
+        print(f"RSI_ENTRY={row[0]}, RSI_EXIT={row[1]}, SL_MULT={row[2]}, TP_MULT={row[3]}, SMA_LEN={row[4]}, ATR_THRESH={row[5]} => Total PnL: {row[6]:.2f}")
+    if best_params is not None and best_pnl != -np.inf:
+        print(f"\nBest Params: RSI_ENTRY={best_params[0]}, RSI_EXIT={best_params[1]}, SL_MULT={best_params[2]}, TP_MULT={best_params[3]}, SMA_LEN={best_params[4]}, ATR_THRESH={best_params[5]} => Total PnL: {best_pnl:.2f}")
+    else:
+        print("\nNo valid trades for any parameter combination.")
+    return best_params
 
 # --- Main Backtest Logic ---
 def run_backtest(symbols, data_dir, model_path=None, starting_cash=25000):
@@ -322,6 +358,7 @@ if __name__ == "__main__":
     symbols = ['SPY']
     data_dir = os.getcwd()
     # Example: run with transaction costs, slippage, and out-of-sample split
-    run_backtest_param_split(symbols, data_dir, 15, 60, 1.0, 1.0, 50, 5.0, verbose=True, commission=1.0, slippage_bps=1)
+    run_backtest_param_split(symbols, data_dir, 10, 70, 1.5, 1.5, 30, 5.0, verbose=True, commission=1.0, slippage_bps=1)
     #run_backtest_param(symbols, data_dir, 15, 60, 1.0, 1.0, 50, 5.0, verbose=True)
     #run_backtest(symbols, data_dir, None)
+    #grid_search(symbols, data_dir)
