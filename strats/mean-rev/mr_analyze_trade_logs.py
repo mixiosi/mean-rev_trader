@@ -5,7 +5,7 @@ import numpy as np
 import os
 
 # Automatically find all trade log CSVs in the current directory
-trade_log_files = glob.glob("*_sample_trades*.csv") + glob.glob("*_sample_trades_*.csv")
+trade_log_files = glob.glob("*trade*.csv")
 
 for file in trade_log_files:
     print(f"\n--- Analyzing {file} ---")
@@ -40,7 +40,7 @@ for file in trade_log_files:
 
     # Plot equity curve
     plt.figure(figsize=(10,5))
-    equity = df['pnl'].cumsum()
+    equity = df['pnl'].cumsum() + 25000  # Start equity at $25,000
     plt.plot(df['exit_time'], equity, label='Equity Curve')
     plt.title(f"Equity Curve: {os.path.basename(file)}")
     plt.xlabel("Time")
@@ -59,7 +59,7 @@ for file in trade_log_files:
     plt.show()
 
     # Plot rolling drawdown
-    equity = df['pnl'].cumsum()
+    equity = df['pnl'].cumsum() + 25000  # Start equity at $25,000
     roll_max = equity.cummax()
     drawdown = equity - roll_max
     plt.figure(figsize=(10,4))
@@ -72,7 +72,7 @@ for file in trade_log_files:
 
     # Print drawdown stats
     print(f"Max Drawdown: {drawdown.min():.2f}")
-    print(f"Max Drawdown (percent): {100 * drawdown.min() / (equity.iloc[0] if equity.iloc[0] != 0 else 1):.2f}%")
+    print(f"Max Drawdown (percent): {100 * drawdown.min() / 25000:.2f}%")
 
     # Optional: print trade PnL quantiles
     print("Trade PnL Quantiles:")
